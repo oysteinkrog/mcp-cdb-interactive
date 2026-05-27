@@ -789,7 +789,9 @@ class CDBSession:
         Args:
             dump_path: Path to a user-mode .dmp/.mdmp/.hdmp file.
             cdb_path: Path to cdb.exe (auto-detected if not provided).
-            symbol_path: Optional override for symbol search (prepended to env).
+            symbol_path: Optional symbol search path (-y). Replaces
+                _NT_SYMBOL_PATH for this session; include the env value
+                in the string to keep it.
             image_path: Optional executable image search path (-i).
             timeout: Initialisation timeout in seconds. Default 300s to allow
                 cold-cache symbol downloads from msdl on first run.

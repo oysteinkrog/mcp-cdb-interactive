@@ -152,9 +152,11 @@ class CdbOpenDumpParams(BaseModel):
     symbol_path: Optional[str] = Field(
         default=None,
         description=(
-            "Symbol path override (-y). Prepended to _NT_SYMBOL_PATH from the "
-            "environment. Example: 'SRV*C:\\\\Symbols*https://msdl.microsoft.com/download/symbols' "
-            "or a local PDB directory. Leave unset to use the server's _NT_SYMBOL_PATH."
+            "Symbol path override (-y). REPLACES _NT_SYMBOL_PATH for this "
+            "session — to combine local PDBs with the public symbol server, "
+            "supply the full combined path, e.g.: "
+            "'C:\\\\MyPdbs;SRV*C:\\\\Symbols*https://msdl.microsoft.com/download/symbols'. "
+            "Leave unset to use the server's _NT_SYMBOL_PATH environment variable."
         )
     )
     image_path: Optional[str] = Field(
@@ -667,7 +669,13 @@ def create_server(
             elif name == "cdb_detach":
                 session = _get_session()
                 is_dump = session.session_kind == "dump"
-                await asyncio.to_thread(session.detach)
+                if is_dump:
+                    # .detach errors on a dump (no live process to detach
+                    # from); close() sends only `q`, which is the correct
+                    # exit primitive per CDB docs.
+                    await asyncio.to_thread(session.close)
+                else:
+                    await asyncio.to_thread(session.detach)
                 _session = None
                 return [TextContent(
                     type="text",
