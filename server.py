@@ -8,7 +8,6 @@ import argparse
 import asyncio
 import atexit
 import logging
-import re
 import sys
 from typing import Optional
 
@@ -24,44 +23,15 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field
 
-from cdb_session import CDBSession, CDBError, _find_cdb, ALLOWED_RESUME_COMMANDS
+from cdb_session import (
+    CDBSession,
+    CDBError,
+    _find_cdb,
+    ALLOWED_RESUME_COMMANDS,
+    is_dangerous_command,
+)
 
 logger = logging.getLogger(__name__)
-
-# Dangerous CDB commands that can execute arbitrary OS commands or load code
-# These are blocked by default to prevent prompt injection attacks
-DANGEROUS_COMMAND_PATTERNS = [
-    re.compile(r"^\s*\.shell\b", re.IGNORECASE),      # OS command execution
-    re.compile(r"^\s*\.script\w*\b", re.IGNORECASE),  # Script loading/execution
-    re.compile(r"^\s*\.load\b", re.IGNORECASE),       # Extension DLL loading
-    re.compile(r"^\s*\.loadby\b", re.IGNORECASE),     # Extension DLL loading
-    re.compile(r"^\s*!for_each_\w+", re.IGNORECASE),  # Iteration with command execution
-    re.compile(r"^\s*!shell\b", re.IGNORECASE),       # Shell extension alias
-    re.compile(r"^\s*\.writemem\b", re.IGNORECASE),   # Write to memory file
-    re.compile(r"^\s*\.create\b", re.IGNORECASE),     # Create process
-]
-
-# Split commands on semicolons and newlines (prevents newline-based bypass)
-_CMD_SEPARATOR_RE = re.compile(r"[;\r\n]+")
-
-
-def _is_dangerous_command(command: str, allow_dangerous: bool = False) -> Optional[str]:
-    """Check if a command matches dangerous patterns.
-
-    Returns the matched pattern description if dangerous, None if safe.
-    """
-    if allow_dangerous:
-        return None
-
-    # Split by semicolons AND newlines to prevent bypass
-    for subcmd in _CMD_SEPARATOR_RE.split(command):
-        subcmd = subcmd.strip()
-        if not subcmd:
-            continue
-        for pattern in DANGEROUS_COMMAND_PATTERNS:
-            if pattern.match(subcmd):
-                return pattern.pattern
-    return None
 
 # Single active session (one debugger at a time)
 _session: Optional[CDBSession] = None
@@ -346,7 +316,7 @@ def create_server(
                 session = _get_session()
                 params = CdbCmdParams(**arguments)
 
-                dangerous = _is_dangerous_command(
+                dangerous = is_dangerous_command(
                     params.command, allow_dangerous_commands
                 )
                 if dangerous:
