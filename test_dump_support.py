@@ -7,15 +7,42 @@ without needing a real cdb.exe.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
 from unittest import mock
 
 import pydantic
+from mcp.types import CallToolRequest, CallToolRequestParams
 
 import cdb_session as cs
 import server
+
+
+def _call_tool_sync(srv, name, arguments):
+    """Dispatch a tool call through the MCP server's CallToolRequest handler.
+
+    Returns the inner CallToolResult so tests can check .content / .isError.
+    """
+    handler = srv.request_handlers[CallToolRequest]
+    req = CallToolRequest(
+        method="tools/call",
+        params=CallToolRequestParams(name=name, arguments=arguments),
+    )
+    result = asyncio.run(handler(req))
+    return result.root
+
+
+def _fake_session(session_kind="dump", dump_path=None, pid=0x1a2b):
+    """A minimal CDBSession stand-in for handler integration tests."""
+    sess = mock.MagicMock(spec=cs.CDBSession)
+    sess.session_id = "fake-uuid"
+    sess.session_kind = session_kind
+    sess.dump_path = dump_path
+    sess.pid = pid
+    sess.state = "broken"
+    return sess
 
 
 # Bytes we use to fabricate fixture dumps. Real dumps start with their
@@ -280,6 +307,263 @@ class TriageHelpersTests(unittest.TestCase):
         self.assertTrue(server._detect_clr("mscorlib.dll"))
         self.assertTrue(server._detect_clr("System.Private.CoreLib.dll"))
         self.assertFalse(server._detect_clr("kernel32.dll user32.dll"))
+
+
+class HardeningRegressionTests(unittest.TestCase):
+    """Regression guards for the post-merge review findings (H1, H2)."""
+
+    def test_foreach_blocked(self):
+        # Reviewer B finding 1: .foreach takes a brace-delimited body that
+        # the ;/newline splitter does not see inside.
+        self.assertIsNotNone(cs.is_dangerous_command(
+            ".foreach (x {lm}) { .shell whoami }"
+        ))
+
+    def test_do_blocked(self):
+        self.assertIsNotNone(cs.is_dangerous_command(".do { .shell evil }"))
+
+    def test_while_blocked(self):
+        self.assertIsNotNone(cs.is_dangerous_command(".while (1) { .shell }"))
+
+    def test_unc_dump_path_rejected(self):
+        # Reviewer B finding 2: UNC dump paths were inconsistent with image
+        # path validation — fixed in mcd-h1.
+        with self.assertRaisesRegex(cs.CDBError, "UNC"):
+            cs._validate_dump_path("\\\\evil-server\\share\\crash.dmp")
+
+    def test_all_managed_extensions_classified(self):
+        # Reviewer D finding: only `sos` was spot-checked in the original
+        # `test_categorisation`. The dual-loadby handler branches on
+        # _MANAGED_EXTENSIONS membership for ALL five names.
+        for name in ("sos", "sosex", "mex", "psscor4", "netext"):
+            with self.subTest(name=name):
+                self.assertIn(name, server._MANAGED_EXTENSIONS)
+                self.assertNotIn(name, server._BUILTIN_EXTENSIONS)
+        for name in ("wow64exts", "exts"):
+            with self.subTest(name=name):
+                self.assertIn(name, server._BUILTIN_EXTENSIONS)
+                self.assertNotIn(name, server._MANAGED_EXTENSIONS)
+
+    def test_per_step_caps_match_design(self):
+        # Reviewer D finding: only !analyze -v cap was guarded; if kn and
+        # ~*kn swapped position, !analyze stays at 500 but stack-depth
+        # changes silently.
+        caps = {step[1]: step[2] for step in server._TRIAGE_STEPS}
+        self.assertEqual(caps["kn"], 60)
+        self.assertEqual(caps["~*kn"], 200)
+        self.assertEqual(caps["lm"], 100)
+
+
+class OpenDumpHandlerTests(unittest.TestCase):
+    """End-to-end tests through the MCP CallToolRequest dispatcher."""
+
+    def setUp(self):
+        self.srv = server.create_server()
+        self.tmp = tempfile.mkdtemp()
+        self.dump = _make_dump(self.tmp, "good.dmp", _USER_DUMP_MAGIC)
+        # Reset module-level session state between tests.
+        server._session = None
+
+    def tearDown(self):
+        server._session = None
+
+    def _patch_open_dump(self, fake):
+        return mock.patch.object(cs.CDBSession, "open_dump", return_value=fake)
+
+    def test_cdb_error_becomes_invalid_params(self):
+        # Reviewer D + FOR oracle: validation failures from open_dump must
+        # surface as INVALID_PARAMS in the MCP result, not as a leaky
+        # INTERNAL_ERROR. The MCP framework converts McpError into an
+        # isError=True result; we just need to confirm the path is exercised.
+        with mock.patch.object(
+            cs.CDBSession, "open_dump",
+            side_effect=cs.CDBError("synthetic validation failure"),
+        ):
+            res = _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": "ignored.dmp", "auto_triage": False},
+            )
+        self.assertTrue(res.isError, "CDBError should propagate as an error result")
+        text = res.content[0].text
+        self.assertIn("synthetic validation failure", text)
+
+    def test_auto_triage_false_returns_header_only(self):
+        fake = _fake_session(dump_path=self.dump)
+        with self._patch_open_dump(fake):
+            res = _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": self.dump, "auto_triage": False},
+            )
+        self.assertFalse(res.isError)
+        text = res.content[0].text
+        self.assertIn("Auto-triage skipped", text)
+        # The BEGIN/END framing only appears when the sweep actually ran.
+        self.assertNotIn("BEGIN DEBUGGER OUTPUT", text)
+        # session.send_command must NOT have been called for the sweep.
+        fake.send_command.assert_not_called()
+
+    def test_auto_triage_true_includes_begin_end_framing(self):
+        fake = _fake_session(dump_path=self.dump)
+        fake.send_command.return_value = "(stub output)"
+        with self._patch_open_dump(fake):
+            res = _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": self.dump, "auto_triage": True},
+            )
+        self.assertFalse(res.isError)
+        text = res.content[0].text
+        # Framing markers are a defence against prompt injection from
+        # attacker-controlled symbol names. If they disappear, this test
+        # catches it before merge.
+        self.assertIn("--- BEGIN DEBUGGER OUTPUT (untrusted dump content) ---", text)
+        self.assertIn("--- END DEBUGGER OUTPUT ---", text)
+
+    def test_auto_triage_runs_canonical_steps_in_order(self):
+        fake = _fake_session(dump_path=self.dump)
+        fake.send_command.return_value = "stub"
+        with self._patch_open_dump(fake):
+            _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": self.dump, "auto_triage": True},
+            )
+        calls = [c.args[0] for c in fake.send_command.call_args_list]
+        self.assertEqual(
+            calls,
+            [".lastevent", "!analyze -v", "kn", "~*kn", "lm"],
+        )
+        self.assertNotIn(".ecxr", calls, ".ecxr must NOT be in the unconditional sweep")
+
+    def test_clr_hint_fires_when_lm_mentions_managed_runtime(self):
+        fake = _fake_session(dump_path=self.dump)
+        # send_command returns different text per call; the last call is `lm`.
+        # Use side_effect to return CLR-mentioning text only for lm.
+        outputs = {
+            ".lastevent": "Last event: c0000005",
+            "!analyze -v": "analysis stub",
+            "kn": "stack stub",
+            "~*kn": "all stacks stub",
+            "lm": "00400000  myapp.exe\n7ffe0000  coreclr.dll",
+        }
+        fake.send_command.side_effect = lambda cmd, *a, **kw: outputs.get(cmd, "")
+        with self._patch_open_dump(fake):
+            res = _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": self.dump, "auto_triage": True},
+            )
+        text = res.content[0].text
+        self.assertIn("cdb_load_extension", text, "CLR hint should fire when lm mentions coreclr")
+        self.assertIn("sos", text)
+
+    def test_clr_hint_absent_for_native_only_dump(self):
+        fake = _fake_session(dump_path=self.dump)
+        outputs = {
+            ".lastevent": "Last event: c0000005",
+            "!analyze -v": "analysis stub",
+            "kn": "stack stub",
+            "~*kn": "all stacks stub",
+            "lm": "00400000  myapp.exe\n7ffe0000  kernel32.dll\n7fff0000  user32.dll",
+        }
+        fake.send_command.side_effect = lambda cmd, *a, **kw: outputs.get(cmd, "")
+        with self._patch_open_dump(fake):
+            res = _call_tool_sync(
+                self.srv, "cdb_open_dump",
+                {"dump_path": self.dump, "auto_triage": True},
+            )
+        text = res.content[0].text
+        # Hints section is always emitted (contains the .ecxr reminder), but
+        # the CLR-specific hint line must NOT appear.
+        self.assertNotIn("CLR/CoreCLR modules detected", text)
+
+
+class LoadExtensionHandlerTests(unittest.TestCase):
+    """Reviewer A finding 2 + Reviewer D 1b: dispatch behaviour was untested."""
+
+    def setUp(self):
+        self.srv = server.create_server()
+        server._session = _fake_session(session_kind="dump")
+
+    def tearDown(self):
+        server._session = None
+
+    def test_managed_extension_emits_both_loadby_commands(self):
+        # The defining behaviour: avoid brittle error-text parsing by
+        # running both .loadby <ext> clr AND .loadby <ext> coreclr.
+        server._session.send_command.return_value = "stub"
+        res = _call_tool_sync(self.srv, "cdb_load_extension", {"name": "sos"})
+        self.assertFalse(res.isError)
+        cmds = [c.args[0] for c in server._session.send_command.call_args_list]
+        self.assertIn(".loadby sos clr", cmds)
+        self.assertIn(".loadby sos coreclr", cmds)
+        self.assertEqual(len(cmds), 2, "managed extensions should fire exactly two commands")
+
+    def test_managed_netext_also_dual_loadby(self):
+        # Regression guard for _MANAGED_EXTENSIONS completeness — if netext
+        # were accidentally removed, this would emit a single .load instead.
+        server._session.send_command.return_value = "stub"
+        _call_tool_sync(self.srv, "cdb_load_extension", {"name": "netext"})
+        cmds = [c.args[0] for c in server._session.send_command.call_args_list]
+        self.assertIn(".loadby netext clr", cmds)
+        self.assertIn(".loadby netext coreclr", cmds)
+
+    def test_builtin_extension_uses_plain_load(self):
+        server._session.send_command.return_value = "stub"
+        _call_tool_sync(self.srv, "cdb_load_extension", {"name": "wow64exts"})
+        cmds = [c.args[0] for c in server._session.send_command.call_args_list]
+        self.assertEqual(cmds, [".load wow64exts"])
+
+    def test_unknown_extension_rejected_at_dispatch(self):
+        res = _call_tool_sync(
+            self.srv, "cdb_load_extension", {"name": "evil_payload"},
+        )
+        self.assertTrue(res.isError)
+
+
+class CdbGoBlockingTests(unittest.TestCase):
+    """Reviewer D §9: gating via call_tool, not just the helper in isolation."""
+
+    def setUp(self):
+        self.srv = server.create_server()
+
+    def tearDown(self):
+        server._session = None
+
+    def test_cdb_go_blocked_on_dump_session(self):
+        server._session = _fake_session(session_kind="dump")
+        res = _call_tool_sync(self.srv, "cdb_go", {"command": "g"})
+        self.assertTrue(res.isError)
+        self.assertIn("dump", res.content[0].text)
+
+    def test_cdb_break_blocked_on_dump_session(self):
+        server._session = _fake_session(session_kind="dump")
+        res = _call_tool_sync(self.srv, "cdb_break", {})
+        self.assertTrue(res.isError)
+        self.assertIn("dump", res.content[0].text)
+
+
+class DetachDumpSessionTests(unittest.TestCase):
+    """Reviewer A finding 1: dump detach must call close() not detach()."""
+
+    def setUp(self):
+        self.srv = server.create_server()
+
+    def tearDown(self):
+        server._session = None
+
+    def test_detach_on_dump_calls_close_not_detach(self):
+        sess = _fake_session(session_kind="dump", dump_path="C:\\x.dmp")
+        server._session = sess
+        res = _call_tool_sync(self.srv, "cdb_detach", {})
+        self.assertFalse(res.isError)
+        sess.close.assert_called_once()
+        sess.detach.assert_not_called()
+
+    def test_detach_on_live_calls_detach(self):
+        sess = _fake_session(session_kind="live-launch")
+        server._session = sess
+        res = _call_tool_sync(self.srv, "cdb_detach", {})
+        self.assertFalse(res.isError)
+        sess.detach.assert_called_once()
+        sess.close.assert_not_called()
 
 
 if __name__ == "__main__":
