@@ -146,13 +146,19 @@ class CDBSession:
         self,
         cdb_path: str,
         args: list[str],
+        *,
+        session_kind: str,
         timeout: int = 30,
         verbose: bool = False,
     ):
+        if session_kind not in ("live-launch", "live-attach", "dump"):
+            raise CDBError(f"Invalid session_kind: {session_kind!r}")
         self.session_id = str(uuid.uuid4())
         self.cdb_path = cdb_path
         self.timeout = timeout
         self.verbose = verbose
+        self.session_kind = session_kind
+        self.dump_path: Optional[str] = None
         self._state = "starting"
         self._target_pid: Optional[int] = None
 
@@ -619,6 +625,7 @@ class CDBSession:
         session = cls(
             cdb_path=resolved_cdb,
             args=args,
+            session_kind="live-launch",
             timeout=timeout,
             verbose=verbose,
         )
@@ -652,6 +659,7 @@ class CDBSession:
         session = cls(
             cdb_path=resolved_cdb,
             args=args,
+            session_kind="live-attach",
             timeout=timeout,
             verbose=verbose,
         )
