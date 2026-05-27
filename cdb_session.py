@@ -84,12 +84,23 @@ DANGEROUS_COMMAND_PATTERNS = [
     re.compile(r"^\s*\.net\b", re.IGNORECASE),         # Loads managed debugging extension
     re.compile(r"^\s*\.dvalloc\b", re.IGNORECASE),     # Allocate virtual memory in debuggee
     re.compile(r"^\s*\.dvfree\b", re.IGNORECASE),      # Free virtual memory in debuggee
-    # Scripting commands with brace-delimited bodies. The splitter on
-    # [;\r\n] does not see inside { ... } blocks, so without these patterns
-    # `.foreach (x {lm}) { .shell whoami }` would bypass the .shell block.
+    # Scripting / control-flow commands with brace-delimited bodies. The
+    # splitter on [;\r\n] does not see inside { ... } blocks, so without
+    # these patterns `.if (1) { .shell whoami }` (and all siblings)
+    # would bypass the .shell block.
     re.compile(r"^\s*\.foreach\b", re.IGNORECASE),
     re.compile(r"^\s*\.do\b", re.IGNORECASE),
     re.compile(r"^\s*\.while\b", re.IGNORECASE),
+    re.compile(r"^\s*\.if\b", re.IGNORECASE),
+    re.compile(r"^\s*\.elsif\b", re.IGNORECASE),
+    re.compile(r"^\s*\.else\b", re.IGNORECASE),
+    re.compile(r"^\s*\.for\b", re.IGNORECASE),
+    re.compile(r"^\s*\.block\b", re.IGNORECASE),
+    re.compile(r"^\s*\.catch\b", re.IGNORECASE),
+    re.compile(r"^\s*\.continue\b", re.IGNORECASE),
+    re.compile(r"^\s*\.break\b", re.IGNORECASE),
+    # Command-file include forms — read and execute commands from a file.
+    re.compile(r"^\s*\$\$?>?<", re.IGNORECASE),        # $<, $$<, $><, $$><
 ]
 
 # Split commands on semicolons and newlines (prevents newline-based bypass).
@@ -117,12 +128,31 @@ class CDBError(Exception):
     pass
 
 
+class CDBValidationError(CDBError):
+    """Raised by path/parameter validators.
+
+    The MCP server maps this to INVALID_PARAMS, distinct from operational
+    CDBError (process spawn failure, command timeout, etc.) which maps to
+    INTERNAL_ERROR.
+    """
+
+
 def _validate_path(path: str, label: str = "path") -> None:
     """Reject paths containing characters that could cause CDB command injection."""
     bad = _UNSAFE_PATH_CHARS.intersection(path)
     if bad:
         chars = ", ".join(repr(c) for c in sorted(bad))
-        raise CDBError(f"Invalid {label}: contains unsafe characters {chars}")
+        raise CDBValidationError(f"Invalid {label}: contains unsafe characters {chars}")
+
+
+def _has_unc_prefix(path: str) -> bool:
+    """True if path is a UNC path under either separator convention.
+
+    Windows accepts `//server/share` in many contexts as a synonym for
+    `\\\\server\\share`, so check both forms before any filesystem call.
+    """
+    normalised = path.replace("/", "\\")
+    return normalised.startswith("\\\\")
 
 
 # Kernel-mode dump magic bytes at file offset 0 (cdb.exe cannot open these)
@@ -142,29 +172,29 @@ def _validate_dump_path(path: str) -> None:
     """
     _validate_path(path, "dump path")
     if path.startswith("-"):
-        raise CDBError("Invalid dump path: cannot start with '-'")
-    if path.startswith("\\\\"):
-        raise CDBError(
+        raise CDBValidationError("Invalid dump path: cannot start with '-'")
+    if _has_unc_prefix(path):
+        raise CDBValidationError(
             "UNC paths are not allowed for dump files. Copy the dump locally "
             "or map the share to a drive letter."
         )
     m = re.search(r"\\+$", path)
     if m and len(m.group()) % 2 == 1:
-        raise CDBError("Invalid dump path: odd number of trailing backslashes")
+        raise CDBValidationError("Invalid dump path: odd number of trailing backslashes")
     if not path.lower().endswith(_DUMP_SUFFIXES):
-        raise CDBError(
+        raise CDBValidationError(
             f"Unsupported dump file extension: {path!r}. "
             f"Expected one of {_DUMP_SUFFIXES}."
         )
     if not os.path.isfile(path):
-        raise CDBError(f"Dump file not found: {path}")
+        raise CDBValidationError(f"Dump file not found: {path}")
     try:
         with open(path, "rb") as f:
             head = f.read(8)
     except OSError as e:
-        raise CDBError(f"Cannot read dump header: {e}")
+        raise CDBValidationError(f"Cannot read dump header: {e}")
     if head in KERNEL_DUMP_MAGICS:
-        raise CDBError(
+        raise CDBValidationError(
             f"Kernel-mode dump detected (magic {head!r}). "
             f"cdb.exe only handles user-mode dumps; use kd.exe or windbg.exe."
         )
@@ -185,23 +215,23 @@ def _validate_sympath(sympath: str) -> None:
     per-component rules.
     """
     if len(sympath) > 2048:
-        raise CDBError("Symbol path too long (max 2048 chars)")
+        raise CDBValidationError("Symbol path too long (max 2048 chars)")
     for raw in sympath.split(";"):
         component = raw.strip()
         if not component:
             continue
         if any(c in component for c in '"\r\n'):
-            raise CDBError(f"Invalid symbol-path component: {component!r}")
+            raise CDBValidationError(f"Invalid symbol-path component: {component!r}")
         # URL inside a component: validate strictly. Strip leading SRV*..*  prefix.
         url_part = component
         if "*" in component:
             head, _, tail = component.rpartition("*")
             url_part = tail
             if not _SYMPATH_SRV_RE.match(component) and "://" not in tail:
-                raise CDBError(f"Invalid SRV component: {component!r}")
+                raise CDBValidationError(f"Invalid SRV component: {component!r}")
         if "://" in url_part:
             if not _SYMPATH_URL_RE.match(url_part):
-                raise CDBError(
+                raise CDBValidationError(
                     f"Invalid symbol-server URL: {url_part!r} "
                     f"(no credentials, query strings, or fragments allowed)"
                 )
@@ -214,15 +244,15 @@ def _validate_search_path(path: str) -> None:
     UNC paths (\\\\server\\share) to prevent unintended network traversal.
     """
     if len(path) > 2048:
-        raise CDBError("Search path too long (max 2048 chars)")
+        raise CDBValidationError("Search path too long (max 2048 chars)")
     for raw in path.split(";"):
         component = raw.strip()
         if not component:
             continue
         if any(c in component for c in '"\r\n'):
-            raise CDBError(f"Invalid search-path component: {component!r}")
-        if component.startswith("\\\\"):
-            raise CDBError(
+            raise CDBValidationError(f"Invalid search-path component: {component!r}")
+        if _has_unc_prefix(component):
+            raise CDBValidationError(
                 f"UNC paths not allowed in search path: {component!r}"
             )
 
@@ -260,7 +290,7 @@ class CDBSession:
         verbose: bool = False,
     ):
         if session_kind not in ("live-launch", "live-attach", "dump"):
-            raise CDBError(f"Invalid session_kind: {session_kind!r}")
+            raise CDBValidationError(f"Invalid session_kind: {session_kind!r}")
         self.session_id = str(uuid.uuid4())
         self.cdb_path = cdb_path
         self.timeout = timeout
@@ -376,6 +406,7 @@ class CDBSession:
         init_id = str(uuid.uuid4())
         self._cmd_event.clear()
         with self._lock:
+            self._marker_observed = False
             self._pending_marker_id = init_id
             self._output_lines.clear()
 
@@ -391,9 +422,24 @@ class CDBSession:
             raise CDBError("CDB initialization timed out")
 
         with self._lock:
+            marker_was_seen = self._marker_observed
+            self._pending_marker_id = None
+            tail = list(self._output_lines)[-30:]
             if self._state != "exited":
                 self._state = "broken"
             self._output_lines.clear()
+
+        # The reader thread's finally clause also sets the event, so a
+        # set event does not by itself mean the marker arrived. Without
+        # this check, a CDB that died on startup (corrupt dump, missing
+        # binary, etc.) would return a session that looks "broken" but
+        # is actually exited — same fix as send_command() at the bottom.
+        if not marker_was_seen:
+            tail_text = "\n".join(tail) if tail else "(no output)"
+            raise CDBError(
+                "CDB exited before producing the initial prompt. "
+                f"Last output:\n{tail_text}"
+            )
 
     def _resolve_debuggee_pid(self):
         """Detect the debuggee's PID using the | command."""
