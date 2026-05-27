@@ -762,3 +762,55 @@ class CDBSession:
         )
         session._target_pid = pid
         return session
+
+    @classmethod
+    def open_dump(
+        cls,
+        dump_path: str,
+        cdb_path: str = "",
+        symbol_path: Optional[str] = None,
+        image_path: Optional[str] = None,
+        timeout: int = 300,
+        verbose: bool = False,
+    ) -> "CDBSession":
+        """Open a user-mode crash dump for postmortem analysis.
+
+        Args:
+            dump_path: Path to a user-mode .dmp/.mdmp/.hdmp file.
+            cdb_path: Path to cdb.exe (auto-detected if not provided).
+            symbol_path: Optional override for symbol search (prepended to env).
+            image_path: Optional executable image search path (-i).
+            timeout: Initialisation timeout in seconds. Default 300s to allow
+                cold-cache symbol downloads from msdl on first run.
+            verbose: Enable verbose logging.
+
+        Raises:
+            CDBError: if validation fails (bad path, kernel dump, missing file,
+                injection-unsafe path, etc).
+        """
+        _validate_dump_path(dump_path)
+        if symbol_path is not None:
+            _validate_sympath(symbol_path)
+        if image_path is not None:
+            _validate_search_path(image_path)
+
+        resolved_cdb = _find_cdb(cdb_path) if cdb_path else _find_cdb()
+
+        # NB: -G (ignore final breakpoint) and -o (debug child processes) are
+        # live-process flags and must NOT be passed in dump mode.
+        args: list[str] = []
+        if symbol_path:
+            args.extend(["-y", symbol_path])
+        if image_path:
+            args.extend(["-i", image_path])
+        args.extend(["-z", dump_path])
+
+        session = cls(
+            cdb_path=resolved_cdb,
+            args=args,
+            session_kind="dump",
+            timeout=timeout,
+            verbose=verbose,
+        )
+        session.dump_path = dump_path
+        return session
