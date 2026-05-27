@@ -90,8 +90,12 @@ cdb_dump(path="C:\\temp\\crash.dmp")
 
 ```
 cdb_open_dump(dump_path="C:\\crashes\\myapp.dmp")
-# Sweep includes the exception, all thread stacks, and module list.
-cdb_cmd(command=".ecxr")              # only if Last Event showed a real exception
+# Sweep returns Last Event, !analyze -v, the current thread stack,
+# all thread stacks, and the module list.
+cdb_cmd(command=".ecxr")   # run only when Last Event shows a real
+                           # exception (code c000xxxx). Skip if the
+                           # code is 80000003 (breakpoint) or 80000007
+                           # (single step) — those are hang/manual dumps.
 cdb_cmd(command="dt MyApp!Ctx poi(r9)")
 ```
 

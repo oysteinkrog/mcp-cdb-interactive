@@ -34,6 +34,17 @@ def _call_tool_sync(srv, name, arguments):
     return result.root
 
 
+def _make_test_server():
+    """Build a Server instance without requiring a real cdb.exe.
+
+    GPT Pro review #9: handler tests previously called create_server()
+    directly, which invokes _find_cdb() at construction. That depends
+    on the local environment.
+    """
+    with mock.patch.object(server, "_find_cdb", return_value="C:\\fake\\cdb.exe"):
+        return server.create_server()
+
+
 def _fake_session(session_kind="dump", dump_path=None, pid=0x1a2b):
     """A minimal CDBSession stand-in for handler integration tests."""
     sess = mock.MagicMock(spec=cs.CDBSession)
@@ -358,7 +369,7 @@ class OpenDumpHandlerTests(unittest.TestCase):
     """End-to-end tests through the MCP CallToolRequest dispatcher."""
 
     def setUp(self):
-        self.srv = server.create_server()
+        self.srv = _make_test_server()
         self.tmp = tempfile.mkdtemp()
         self.dump = _make_dump(self.tmp, "good.dmp", _USER_DUMP_MAGIC)
         # Reset module-level session state between tests.
@@ -370,22 +381,45 @@ class OpenDumpHandlerTests(unittest.TestCase):
     def _patch_open_dump(self, fake):
         return mock.patch.object(cs.CDBSession, "open_dump", return_value=fake)
 
-    def test_cdb_error_becomes_invalid_params(self):
-        # Reviewer D + FOR oracle: validation failures from open_dump must
-        # surface as INVALID_PARAMS in the MCP result, not as a leaky
-        # INTERNAL_ERROR. The MCP framework converts McpError into an
-        # isError=True result; we just need to confirm the path is exercised.
+    def _capture_mcp_error_codes(self, side_effect):
+        """Run the handler and capture every McpError(ErrorData(...)) that
+        the production code raises. The outer MCP framework swallows the
+        code and exposes only the message text in the result, so we have
+        to intercept at the ErrorData constructor to verify the code."""
+        codes: list[int] = []
+        real_error_data = server.ErrorData
+        def recording_error_data(*args, **kwargs):
+            instance = real_error_data(*args, **kwargs)
+            codes.append(instance.code)
+            return instance
         with mock.patch.object(
-            cs.CDBSession, "open_dump",
-            side_effect=cs.CDBError("synthetic validation failure"),
-        ):
-            res = _call_tool_sync(
+            cs.CDBSession, "open_dump", side_effect=side_effect,
+        ), mock.patch.object(server, "ErrorData", recording_error_data):
+            _call_tool_sync(
                 self.srv, "cdb_open_dump",
                 {"dump_path": "ignored.dmp", "auto_triage": False},
             )
-        self.assertTrue(res.isError, "CDBError should propagate as an error result")
-        text = res.content[0].text
-        self.assertIn("synthetic validation failure", text)
+        return codes
+
+    def test_validation_error_maps_to_invalid_params(self):
+        # mcd-h5 finding 7: CDBValidationError (path bad / suffix wrong /
+        # kernel magic / etc.) → INVALID_PARAMS, distinct from operational
+        # failures.
+        from mcp.types import INVALID_PARAMS
+        codes = self._capture_mcp_error_codes(
+            cs.CDBValidationError("synthetic bad path"),
+        )
+        self.assertIn(INVALID_PARAMS, codes)
+
+    def test_operational_error_maps_to_internal_error(self):
+        # mcd-h5 finding 7: non-validation CDBError (cdb start failed,
+        # init timeout, early exit) must NOT be classified as caller
+        # input error.
+        from mcp.types import INTERNAL_ERROR
+        codes = self._capture_mcp_error_codes(
+            cs.CDBError("synthetic cdb start failure"),
+        )
+        self.assertIn(INTERNAL_ERROR, codes)
 
     def test_auto_triage_false_returns_header_only(self):
         fake = _fake_session(dump_path=self.dump)
@@ -479,7 +513,7 @@ class LoadExtensionHandlerTests(unittest.TestCase):
     """Reviewer A finding 2 + Reviewer D 1b: dispatch behaviour was untested."""
 
     def setUp(self):
-        self.srv = server.create_server()
+        self.srv = _make_test_server()
         server._session = _fake_session(session_kind="dump")
 
     def tearDown(self):
@@ -522,7 +556,7 @@ class CdbGoBlockingTests(unittest.TestCase):
     """Reviewer D §9: gating via call_tool, not just the helper in isolation."""
 
     def setUp(self):
-        self.srv = server.create_server()
+        self.srv = _make_test_server()
 
     def tearDown(self):
         server._session = None
@@ -544,7 +578,7 @@ class DetachDumpSessionTests(unittest.TestCase):
     """Reviewer A finding 1: dump detach must call close() not detach()."""
 
     def setUp(self):
-        self.srv = server.create_server()
+        self.srv = _make_test_server()
 
     def tearDown(self):
         server._session = None
@@ -564,6 +598,190 @@ class DetachDumpSessionTests(unittest.TestCase):
         self.assertFalse(res.isError)
         sess.detach.assert_called_once()
         sess.close.assert_not_called()
+
+
+class GPTProHardeningTests(unittest.TestCase):
+    """Regression guards for the GPT Pro post-merge review (mcd-h4, mcd-h5)."""
+
+    # --- mcd-h4 finding 1: marker observation check ----------------------
+
+    def test_initial_prompt_detects_cdb_early_exit(self):
+        # If CDB exits without producing the initial prompt — corrupt dump,
+        # missing image, etc. — the constructor must raise CDBError rather
+        # than return a session that looks "broken". Either the
+        # marker-observation check or the wait-timeout path is acceptable;
+        # the invariant is that it does NOT silently succeed.
+        # (Two code paths can win depending on the reader/main race.)
+        with mock.patch("subprocess.Popen") as mock_popen:
+            proc = mock.MagicMock()
+            proc.poll.return_value = 0  # already exited
+            proc.stdin = mock.MagicMock()
+            # Empty iterator → reader exhausts loop → finally clause runs
+            proc.stdout = iter([])
+            mock_popen.return_value = proc
+            with self.assertRaises(cs.CDBError) as ctx:
+                cs.CDBSession(
+                    cdb_path="C:\\fake\\cdb.exe",
+                    args=["-z", "fake.dmp"],
+                    session_kind="dump",
+                    timeout=1,
+                )
+            msg = str(ctx.exception).lower()
+            # Accept either the early-exit path (marker not observed) or
+            # the timeout path. The bug we're guarding against is a SILENT
+            # success, not a specific error message.
+            self.assertTrue(
+                "exited" in msg or "timed out" in msg or "initialization" in msg,
+                f"unexpected message: {msg!r}",
+            )
+
+    # --- mcd-h4 finding 4: expanded blocklist ----------------------------
+
+    def test_if_command_blocked(self):
+        # .if (1) { .shell whoami } was the prior bypass; the splitter
+        # cannot see inside { ... }.
+        self.assertIsNotNone(cs.is_dangerous_command(".if (1) { .shell whoami }"))
+
+    def test_for_command_blocked(self):
+        self.assertIsNotNone(cs.is_dangerous_command(".for (r $t0 = 0; @$t0 < 5; r $t0 = @$t0 + 1) { .shell }"))
+
+    def test_block_command_blocked(self):
+        self.assertIsNotNone(cs.is_dangerous_command(".block { .shell evil }"))
+
+    def test_catch_command_blocked(self):
+        self.assertIsNotNone(cs.is_dangerous_command(".catch { .shell }"))
+
+    def test_script_include_dollar_lt_blocked(self):
+        # $<, $$<, $><, $$>< execute commands from a file — same risk class.
+        for cmd in ("$< script.txt", "$$< script.txt", "$>< s.txt", "$$>< s.txt"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(cs.is_dangerous_command(cmd))
+
+    # --- mcd-h4 finding 5: slash-form UNC --------------------------------
+
+    def test_forward_slash_unc_rejected_for_dump_path(self):
+        # //server/share/x.dmp must be rejected the same as
+        # \\\\server\\share\\x.dmp; previously slipped through.
+        with self.assertRaisesRegex(cs.CDBError, "UNC"):
+            cs._validate_dump_path("//evil-server/share/crash.dmp")
+
+    def test_forward_slash_unc_rejected_for_search_path(self):
+        with self.assertRaisesRegex(cs.CDBError, "UNC"):
+            cs._validate_search_path("//evil-server/share")
+
+    # --- mcd-h4 finding 7: validation-error subclass ---------------------
+
+    def test_validation_errors_are_subclass_instances(self):
+        # The discriminator the server uses to pick INVALID_PARAMS vs
+        # INTERNAL_ERROR is whether the raised exception is a
+        # CDBValidationError. Make sure all the validators actually raise it.
+        with self.assertRaises(cs.CDBValidationError):
+            cs._validate_dump_path("-evil.dmp")
+        with self.assertRaises(cs.CDBValidationError):
+            cs._validate_sympath("https://user@evil.com/x")
+        with self.assertRaises(cs.CDBValidationError):
+            cs._validate_search_path("\\\\evil\\share")
+        # CDBValidationError IS a CDBError (subclass), so existing catches
+        # that rely on the broader type still work.
+        try:
+            cs._validate_dump_path("-evil.dmp")
+        except cs.CDBError:
+            pass  # expected
+        else:
+            self.fail("CDBValidationError must be catchable as CDBError")
+
+    # --- mcd-h5 finding 3: abort sweep on CDBError -----------------------
+
+    def test_sweep_aborts_on_cdb_error_midway(self):
+        # The handler used to `continue` past CDBError; now it must break,
+        # because protocol may be desynchronised.
+        srv = _make_test_server()
+        fake = _fake_session(dump_path="C:\\x.dmp")
+        # First two commands succeed, third raises, remaining must not run.
+        call_log = []
+        def fake_send(cmd, *a, **kw):
+            call_log.append(cmd)
+            if cmd == "kn":
+                raise cs.CDBError("synthetic timeout")
+            return "(stub)"
+        fake.send_command.side_effect = fake_send
+        with mock.patch.object(cs.CDBSession, "open_dump", return_value=fake):
+            res = _call_tool_sync(
+                srv, "cdb_open_dump",
+                {"dump_path": "C:\\x.dmp", "auto_triage": True},
+            )
+        self.assertFalse(res.isError)
+        text = res.content[0].text
+        # Sweep should have called .lastevent and !analyze -v, then kn,
+        # and then STOPPED — no ~*kn, no lm.
+        self.assertEqual(call_log, [".lastevent", "!analyze -v", "kn"])
+        self.assertIn("aborting remaining sweep", text)
+        self.assertIn("Auto-triage aborted early", text)
+
+    # --- mcd-h5 finding 6: independent .loadby attempts ------------------
+
+    def test_load_extension_first_attempt_error_does_not_skip_second(self):
+        # If `.loadby sos clr` raises CDBError, `.loadby sos coreclr` must
+        # still run. Previously they shared a try-block.
+        srv = _make_test_server()
+        sess = _fake_session(session_kind="dump")
+        call_log = []
+        def fake_send(cmd, *a, **kw):
+            call_log.append(cmd)
+            if cmd == ".loadby sos clr":
+                raise cs.CDBError("synthetic timeout on first attempt")
+            return "(stub)"
+        sess.send_command.side_effect = fake_send
+        server._session = sess
+        try:
+            res = _call_tool_sync(srv, "cdb_load_extension", {"name": "sos"})
+            self.assertFalse(res.isError)
+            # Both runtimes must be attempted.
+            self.assertEqual(call_log, [".loadby sos clr", ".loadby sos coreclr"])
+            text = res.content[0].text
+            self.assertIn("CDBError", text)  # first attempt's failure surfaced
+            self.assertIn("coreclr", text)
+        finally:
+            server._session = None
+
+    # --- mcd-h5 finding 8: PID format restored to decimal-primary --------
+
+    def test_cdb_status_pid_is_decimal_primary(self):
+        srv = _make_test_server()
+        sess = _fake_session(session_kind="live-launch", pid=12345)
+        server._session = sess
+        try:
+            res = _call_tool_sync(srv, "cdb_status", {})
+            text = res.content[0].text
+            # Decimal must appear; hex is acceptable as a parenthetical but
+            # the previous decimal-scraping format is what callers expect.
+            self.assertIn("12345", text)
+            self.assertIn("0x3039", text)
+        finally:
+            server._session = None
+
+    def test_cdb_status_dump_session_marks_pid_as_recorded(self):
+        srv = _make_test_server()
+        sess = _fake_session(
+            session_kind="dump", dump_path="C:\\x.dmp", pid=0x1a2b,
+        )
+        server._session = sess
+        try:
+            res = _call_tool_sync(srv, "cdb_status", {})
+            text = res.content[0].text
+            self.assertIn("recorded, not live", text)
+            self.assertIn("C:\\x.dmp", text)
+        finally:
+            server._session = None
+
+    # --- mcd-h5 finding 10: section label rename -------------------------
+
+    def test_section_label_is_current_thread_not_faulting(self):
+        # .ecxr is intentionally skipped, so kn is the current thread, not
+        # necessarily the faulting one. Label must reflect that.
+        labels = [step[0] for step in server._TRIAGE_STEPS]
+        self.assertNotIn("Faulting Thread Stack (kn)", labels)
+        self.assertIn("Current Thread Stack (kn)", labels)
 
 
 if __name__ == "__main__":
