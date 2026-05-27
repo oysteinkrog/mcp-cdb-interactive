@@ -9,7 +9,7 @@ import asyncio
 import atexit
 import logging
 import sys
-from typing import Optional
+from typing import Literal, Optional
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -196,6 +196,29 @@ class CdbWaitParams(BaseModel):
     )
 
 
+# Extensions ship with the debugger and load by name (no path argument from
+# the LLM, so path injection is structurally impossible).
+_MANAGED_EXTENSIONS = ("sos", "sosex", "mex", "psscor4", "netext")
+_BUILTIN_EXTENSIONS = ("wow64exts", "exts")
+
+
+class CdbLoadExtensionParams(BaseModel):
+    """Load a debugger extension from an allowlist."""
+    name: Literal[
+        "sos", "sosex", "mex", "psscor4", "netext", "wow64exts", "exts"
+    ] = Field(
+        description=(
+            "Extension to load. "
+            "'sos' for managed/.NET (most common); "
+            "'sosex'/'mex' for additional managed helpers; "
+            "'psscor4' for .NET 4.x; "
+            "'netext' for ASP.NET-specific commands; "
+            "'wow64exts' for 32-bit WoW64 dumps (follow up with !wow64exts.sw); "
+            "'exts' for the standard user-mode extensions."
+        )
+    )
+
+
 def create_server(
     cdb_path: Optional[str] = None,
     timeout: int = 30,
@@ -225,6 +248,21 @@ def create_server(
                     "Supports invasive (-p) and non-invasive (-pv) attach modes."
                 ),
                 inputSchema=CdbAttachParams.model_json_schema(),
+            ),
+            Tool(
+                name="cdb_load_extension",
+                description=(
+                    "Load a debugger extension by name from a hardcoded "
+                    "allowlist (sos, sosex, mex, psscor4, netext, wow64exts, "
+                    "exts). Required before using !-prefixed commands from "
+                    "that extension. For managed extensions, both .loadby "
+                    "<name> clr and .loadby <name> coreclr are attempted so "
+                    "the call works on both .NET Framework and .NET Core / "
+                    ".NET 5+ dumps. Works on live and dump sessions. "
+                    "Path injection is structurally impossible — only the "
+                    "extension name is accepted, never a path."
+                ),
+                inputSchema=CdbLoadExtensionParams.model_json_schema(),
             ),
             Tool(
                 name="cdb_open_dump",
@@ -384,6 +422,47 @@ def create_server(
                         f"State: {_session.state}"
                     ),
                 )]
+
+            elif name == "cdb_load_extension":
+                session = _get_session()
+                try:
+                    params = CdbLoadExtensionParams(**arguments)
+                except Exception as e:
+                    raise McpError(ErrorData(
+                        code=INVALID_PARAMS,
+                        message=f"Invalid cdb_load_extension params: {e}",
+                    ))
+
+                ext = params.name
+                if ext in _MANAGED_EXTENSIONS:
+                    # Run both runtimes; whichever isn't loaded errors and is
+                    # ignored. Avoids brittle CDB error-text parsing.
+                    out_clr = await asyncio.to_thread(
+                        session.send_command, f".loadby {ext} clr"
+                    )
+                    out_core = await asyncio.to_thread(
+                        session.send_command, f".loadby {ext} coreclr"
+                    )
+                    return [TextContent(
+                        type="text",
+                        text=(
+                            f"Attempted .loadby {ext} clr:\n{out_clr}\n\n"
+                            f"Attempted .loadby {ext} coreclr:\n{out_core}\n\n"
+                            f"At least one of the two should succeed depending "
+                            f"on whether the target is .NET Framework or "
+                            f".NET Core/5+. Use cdb_cmd to invoke extension "
+                            f"commands (e.g., !clrstack)."
+                        ),
+                    )]
+                else:
+                    # wow64exts / exts ship with cdb; plain .load is sufficient.
+                    out = await asyncio.to_thread(
+                        session.send_command, f".load {ext}"
+                    )
+                    return [TextContent(
+                        type="text",
+                        text=f".load {ext}:\n{out}",
+                    )]
 
             elif name == "cdb_open_dump":
                 await asyncio.to_thread(_clear_session)
