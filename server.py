@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from cdb_session import (
     CDBSession,
     CDBError,
+    CDBValidationError,
     _find_cdb,
     ALLOWED_RESUME_COMMANDS,
     is_dangerous_command,
@@ -230,7 +231,10 @@ _TRIAGE_STEPS = [
     # (display label, cdb command, per-section line cap, retrieval command shown on truncation)
     ("Last Event", ".lastevent", 20, ".lastevent"),
     ("!analyze -v", "!analyze -v", 500, '!analyze -v'),
-    ("Faulting Thread Stack (kn)", "kn", 60, "kn"),
+    # NB: this is the CURRENT thread (whatever CDB lands on), not
+    # necessarily the faulting thread — .ecxr would switch context but
+    # is intentionally skipped (see hint emitted post-sweep).
+    ("Current Thread Stack (kn)", "kn", 60, "kn"),
     ("All Thread Stacks (~*kn)", "~*kn", 200, "~*kn"),
     ("Loaded Modules (lm)", "lm", 100, "lm"),
 ]
@@ -478,23 +482,44 @@ def create_server(
 
                 ext = params.name
                 if ext in _MANAGED_EXTENSIONS:
-                    # Run both runtimes; whichever isn't loaded errors and is
-                    # ignored. Avoids brittle CDB error-text parsing.
-                    out_clr = await asyncio.to_thread(
-                        session.send_command, f".loadby {ext} clr"
-                    )
-                    out_core = await asyncio.to_thread(
-                        session.send_command, f".loadby {ext} coreclr"
+                    # `.loadby <ext> <runtime>` resolves the extension from
+                    # the runtime DLL's directory. This is reliable only when
+                    # the extension is colocated with that DLL — true for
+                    # sos (ships with the .NET runtime); third-party
+                    # extensions (sosex/mex/netext) may or may not be
+                    # installed there.
+                    #
+                    # Run both runtime attempts INDEPENDENTLY so a CDBError
+                    # in the first attempt (timeout / protocol failure) does
+                    # not skip the second. Failure text is included in the
+                    # response for the agent to inspect.
+                    attempts = []
+                    for runtime in ("clr", "coreclr"):
+                        try:
+                            out = await asyncio.to_thread(
+                                session.send_command,
+                                f".loadby {ext} {runtime}",
+                            )
+                            attempts.append((runtime, out))
+                        except CDBError as e:
+                            attempts.append((runtime, f"[CDBError: {e}]"))
+                    body = "\n\n".join(
+                        f".loadby {ext} {rt}:\n{out}" for rt, out in attempts
                     )
                     return [TextContent(
                         type="text",
                         text=(
-                            f"Attempted .loadby {ext} clr:\n{out_clr}\n\n"
-                            f"Attempted .loadby {ext} coreclr:\n{out_core}\n\n"
-                            f"At least one of the two should succeed depending "
-                            f"on whether the target is .NET Framework or "
-                            f".NET Core/5+. Use cdb_cmd to invoke extension "
-                            f"commands (e.g., !clrstack)."
+                            f"{body}\n\n"
+                            f"Both runtime attempts are reported above. "
+                            f"For sos: one should succeed depending on whether "
+                            f"the target is .NET Framework (clr) or "
+                            f".NET Core/5+ (coreclr). For third-party "
+                            f"extensions (sosex/mex/netext) success depends "
+                            f"on whether they are installed alongside the "
+                            f"runtime DLL. If both fail, the extension is "
+                            f"not present on this debugger. "
+                            f"On success, use cdb_cmd to invoke extension "
+                            f"commands (e.g., !clrstack, !pe)."
                         ),
                     )]
                 else:
@@ -517,7 +542,7 @@ def create_server(
                         message=f"Invalid cdb_open_dump params: {e}",
                     ))
                 try:
-                    _session = await asyncio.to_thread(
+                    new_session = await asyncio.to_thread(
                         CDBSession.open_dump,
                         dump_path=params.dump_path,
                         cdb_path=resolved_cdb,
@@ -526,23 +551,33 @@ def create_server(
                         timeout=params.timeout or 300,
                         verbose=verbose,
                     )
-                except CDBError as e:
-                    # Validation failures surface as INVALID_PARAMS,
-                    # not INTERNAL_ERROR (per oracle review).
+                except CDBValidationError as e:
                     raise McpError(ErrorData(
                         code=INVALID_PARAMS,
                         message=f"cdb_open_dump: {e}",
                     ))
+                except CDBError as e:
+                    raise McpError(ErrorData(
+                        code=INTERNAL_ERROR,
+                        message=f"cdb_open_dump: {e}",
+                    ))
+
+                # Publish to the global slot, but use the LOCAL reference for
+                # the rest of the handler. Without this, a concurrent
+                # cdb_detach / cdb_launch could null or replace _session
+                # mid-sweep and we'd dereference the wrong (or no) session.
+                _session = new_session
+                session = new_session
                 pid_info = (
-                    f"Target PID: 0x{_session.pid:x} (recorded, not live)"
-                    if _session.pid else "Target PID: unknown"
+                    f"Target PID: 0x{session.pid:x} (recorded, not live)"
+                    if session.pid else "Target PID: unknown"
                 )
                 header = (
                     f"Dump loaded: {params.dump_path}\n"
-                    f"Session: {_session.session_id}\n"
+                    f"Session: {session.session_id}\n"
                     f"Kind: dump (postmortem — cdb_go/cdb_break not applicable)\n"
                     f"{pid_info}\n"
-                    f"State: {_session.state}\n"
+                    f"State: {session.state}\n"
                 )
 
                 if not params.auto_triage:
@@ -556,25 +591,39 @@ def create_server(
 
                 # Run sweep. Per-command timeout is the user-supplied total
                 # session timeout — !analyze -v is the dominant cost on cold
-                # symbol caches. Failures of individual steps are surfaced
-                # inline, not raised.
+                # symbol caches. A CDBError mid-sweep means the protocol may
+                # be desynchronised (command timeout, process exit, broken
+                # pipe), so we abort the remaining steps rather than risk
+                # confusing leftover output with the next command's output.
                 sweep_timeout = params.timeout or 300
                 sections: list[tuple[str, str]] = []
                 lm_text = ""
+                sweep_aborted = False
                 for label, cmd, cap, retrieval in _TRIAGE_STEPS:
                     try:
                         raw = await asyncio.to_thread(
-                            _session.send_command, cmd, sweep_timeout
+                            session.send_command, cmd, sweep_timeout
                         )
                     except CDBError as e:
-                        sections.append((label, f"[error running {cmd!r}: {e}]"))
-                        continue
+                        sections.append((
+                            label,
+                            f"[error running {cmd!r}: {e}; aborting remaining sweep]",
+                        ))
+                        sweep_aborted = True
+                        break
                     capped = _cap_section(raw, cap, retrieval)
                     sections.append((label, capped))
                     if cmd == "lm":
                         lm_text = raw
 
                 hints = []
+                if sweep_aborted:
+                    hints.append(
+                        "Auto-triage aborted early after a CDBError "
+                        "(timeout or protocol failure). The session may be "
+                        "in an unusual state; check cdb_status and consider "
+                        "cdb_detach + cdb_open_dump to retry."
+                    )
                 if _detect_clr(lm_text):
                     hints.append(
                         "CLR/CoreCLR modules detected in lm. For managed "
@@ -584,7 +633,9 @@ def create_server(
                 hints.append(
                     ".ecxr was NOT run during auto-triage (it mutates context "
                     "and would mislead on hang dumps). Call cdb_cmd(\".ecxr\") "
-                    "explicitly if Last Event shows a real exception."
+                    "explicitly if Last Event shows a real exception "
+                    "(code c000xxxx, not 80000003/80000007 which are "
+                    "breakpoint/single-step)."
                 )
 
                 body_parts = ["--- BEGIN DEBUGGER OUTPUT (untrusted dump content) ---"]
@@ -692,9 +743,15 @@ def create_server(
                         type="text",
                         text="Status: no-session\nNo active debugging session.",
                     )]
-                pid_str = (
-                    f"0x{_session.pid:x}" if _session.pid else "unknown"
-                )
+                # PID format is decimal-primary (legacy callers may scrape it)
+                # with a hex parenthetical for ease of cross-referencing dump
+                # tools that surface hex. "unknown" preserved as before.
+                if _session.pid:
+                    pid_str = f"{_session.pid} (0x{_session.pid:x})"
+                    if _session.session_kind == "dump":
+                        pid_str += " — recorded, not live"
+                else:
+                    pid_str = "unknown"
                 dump_line = (
                     f"\nDump file: {_session.dump_path}"
                     if _session.session_kind == "dump" and _session.dump_path
