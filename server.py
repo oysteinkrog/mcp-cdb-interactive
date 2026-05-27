@@ -41,7 +41,7 @@ def _get_session() -> CDBSession:
     if _session is None:
         raise McpError(ErrorData(
             code=INVALID_PARAMS,
-            message="No active debugging session. Use cdb_launch or cdb_attach first."
+            message="No active debugging session. Use cdb_launch, cdb_attach, or cdb_open_dump first."
         ))
     return _session
 
@@ -127,6 +127,47 @@ class CdbDumpParams(BaseModel):
     )
 
 
+class CdbOpenDumpParams(BaseModel):
+    """Open a Windows user-mode crash dump for postmortem analysis."""
+    dump_path: str = Field(
+        description=(
+            "Absolute path to a Windows user-mode crash dump (.dmp, .mdmp, .hdmp). "
+            "For postmortem analysis only — use cdb_launch for new processes or "
+            "cdb_attach for live processes. Kernel dumps are pre-rejected; "
+            "use kd.exe or windbg.exe for those."
+        )
+    )
+    symbol_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Symbol path override (-y). Prepended to _NT_SYMBOL_PATH from the "
+            "environment. Example: 'SRV*C:\\\\Symbols*https://msdl.microsoft.com/download/symbols' "
+            "or a local PDB directory. Leave unset to use the server's _NT_SYMBOL_PATH."
+        )
+    )
+    image_path: Optional[str] = Field(
+        default=None,
+        description=(
+            "Executable image search path (-i). Use when binaries moved since "
+            "the dump was captured. Semicolon-separated for multiple directories."
+        )
+    )
+    auto_triage: bool = Field(
+        default=True,
+        description=(
+            "Run the canonical triage sweep on open (.lastevent, !analyze -v, "
+            "kn, ~*kn, lm). Set false to open without auto-analysis."
+        )
+    )
+    timeout: Optional[int] = Field(
+        default=300,
+        description=(
+            "Timeout in seconds for the initial sweep. Default 300s "
+            "accommodates cold-cache symbol fetches from msdl on first run."
+        )
+    )
+
+
 class CdbOutputParams(BaseModel):
     """Read buffered debugger output."""
     max_lines: int = Field(
@@ -172,6 +213,21 @@ def create_server(
                     "Supports invasive (-p) and non-invasive (-pv) attach modes."
                 ),
                 inputSchema=CdbAttachParams.model_json_schema(),
+            ),
+            Tool(
+                name="cdb_open_dump",
+                description=(
+                    "Open a Windows user-mode crash dump (.dmp/.mdmp/.hdmp) for "
+                    "postmortem analysis. Pre-rejects kernel dumps (cdb cannot "
+                    "open them — use kd.exe or windbg.exe instead). "
+                    "When auto_triage is true (default), runs the canonical "
+                    "sweep: .lastevent, !analyze -v, kn, ~*kn, lm with section "
+                    "caps and a CLR-detection hint. Use this for .dmp files — "
+                    "NOT for live processes (use cdb_launch / cdb_attach). "
+                    "cdb_go and cdb_break are blocked for dump sessions; use "
+                    "cdb_cmd for read-only analysis."
+                ),
+                inputSchema=CdbOpenDumpParams.model_json_schema(),
             ),
             Tool(
                 name="cdb_cmd",
@@ -309,6 +365,52 @@ def create_server(
                         f"Attached to PID {params.pid} ({mode})\n"
                         f"Session: {_session.session_id}\n"
                         f"State: {_session.state}"
+                    ),
+                )]
+
+            elif name == "cdb_open_dump":
+                await asyncio.to_thread(_clear_session)
+                try:
+                    params = CdbOpenDumpParams(**arguments)
+                except Exception as e:
+                    raise McpError(ErrorData(
+                        code=INVALID_PARAMS,
+                        message=f"Invalid cdb_open_dump params: {e}",
+                    ))
+                try:
+                    _session = await asyncio.to_thread(
+                        CDBSession.open_dump,
+                        dump_path=params.dump_path,
+                        cdb_path=resolved_cdb,
+                        symbol_path=params.symbol_path,
+                        image_path=params.image_path,
+                        timeout=params.timeout or 300,
+                        verbose=verbose,
+                    )
+                except CDBError as e:
+                    # Validation failures surface as INVALID_PARAMS,
+                    # not INTERNAL_ERROR (per oracle review).
+                    raise McpError(ErrorData(
+                        code=INVALID_PARAMS,
+                        message=f"cdb_open_dump: {e}",
+                    ))
+                pid_info = (
+                    f"Target PID: 0x{_session.pid:x} (recorded, not live)"
+                    if _session.pid else "Target PID: unknown"
+                )
+                # mcd-7 will replace this with the auto-triage sweep when
+                # params.auto_triage is true.
+                return [TextContent(
+                    type="text",
+                    text=(
+                        f"Dump loaded: {params.dump_path}\n"
+                        f"Session: {_session.session_id}\n"
+                        f"Kind: dump (postmortem — cdb_go/cdb_break not applicable)\n"
+                        f"{pid_info}\n"
+                        f"State: {_session.state}\n"
+                        f"\n"
+                        f"Auto-triage placeholder (will be implemented in mcd-7). "
+                        f"Use cdb_cmd to run analysis commands."
                     ),
                 )]
 
