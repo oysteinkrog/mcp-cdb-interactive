@@ -219,6 +219,47 @@ class CdbLoadExtensionParams(BaseModel):
     )
 
 
+# Auto-triage sweep configuration. .ecxr is intentionally omitted from the
+# unconditional sweep: it mutates the debugger context to the most recent
+# exception record, which on a hang dump (with a stale exception) produces
+# misleading kn/~*kn output. Agents should run .ecxr explicitly when
+# .lastevent indicates a real exception.
+_TRIAGE_STEPS = [
+    # (display label, cdb command, per-section line cap, retrieval command shown on truncation)
+    ("Last Event", ".lastevent", 20, ".lastevent"),
+    ("!analyze -v", "!analyze -v", 500, '!analyze -v'),
+    ("Faulting Thread Stack (kn)", "kn", 60, "kn"),
+    ("All Thread Stacks (~*kn)", "~*kn", 200, "~*kn"),
+    ("Loaded Modules (lm)", "lm", 100, "lm"),
+]
+
+# Modules that signal a managed runtime is present in the dump.
+_CLR_MODULE_HINTS = (
+    "clr", "coreclr", "mscorwks", "mscorlib", "system.private.corelib",
+)
+
+
+def _cap_section(text: str, max_lines: int, retrieval_cmd: str) -> str:
+    """Cap a section's output to max_lines, appending a retrieval hint on truncation."""
+    if not text:
+        return "(no output)"
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    head = "\n".join(lines[:max_lines])
+    return (
+        f"{head}\n"
+        f"[... output truncated ({len(lines) - max_lines} more lines). "
+        f"Use cdb_cmd({retrieval_cmd!r}) for the full output.]"
+    )
+
+
+def _detect_clr(lm_output: str) -> bool:
+    """Return True if lm output mentions a managed runtime module."""
+    lowered = lm_output.lower()
+    return any(hint in lowered for hint in _CLR_MODULE_HINTS)
+
+
 def create_server(
     cdb_path: Optional[str] = None,
     timeout: int = 30,
@@ -494,20 +535,65 @@ def create_server(
                     f"Target PID: 0x{_session.pid:x} (recorded, not live)"
                     if _session.pid else "Target PID: unknown"
                 )
-                # mcd-7 will replace this with the auto-triage sweep when
-                # params.auto_triage is true.
+                header = (
+                    f"Dump loaded: {params.dump_path}\n"
+                    f"Session: {_session.session_id}\n"
+                    f"Kind: dump (postmortem — cdb_go/cdb_break not applicable)\n"
+                    f"{pid_info}\n"
+                    f"State: {_session.state}\n"
+                )
+
+                if not params.auto_triage:
+                    return [TextContent(
+                        type="text",
+                        text=header + (
+                            "\nAuto-triage skipped. Use cdb_cmd to run "
+                            "analysis commands (e.g., .lastevent, !analyze -v)."
+                        ),
+                    )]
+
+                # Run sweep. Per-command timeout is the user-supplied total
+                # session timeout — !analyze -v is the dominant cost on cold
+                # symbol caches. Failures of individual steps are surfaced
+                # inline, not raised.
+                sweep_timeout = params.timeout or 300
+                sections: list[tuple[str, str]] = []
+                lm_text = ""
+                for label, cmd, cap, retrieval in _TRIAGE_STEPS:
+                    try:
+                        raw = await asyncio.to_thread(
+                            _session.send_command, cmd, sweep_timeout
+                        )
+                    except CDBError as e:
+                        sections.append((label, f"[error running {cmd!r}: {e}]"))
+                        continue
+                    capped = _cap_section(raw, cap, retrieval)
+                    sections.append((label, capped))
+                    if cmd == "lm":
+                        lm_text = raw
+
+                hints = []
+                if _detect_clr(lm_text):
+                    hints.append(
+                        "CLR/CoreCLR modules detected in lm. For managed "
+                        "analysis call cdb_load_extension(name=\"sos\") then "
+                        "cdb_cmd(\"!clrstack\") / cdb_cmd(\"!pe\")."
+                    )
+                hints.append(
+                    ".ecxr was NOT run during auto-triage (it mutates context "
+                    "and would mislead on hang dumps). Call cdb_cmd(\".ecxr\") "
+                    "explicitly if Last Event shows a real exception."
+                )
+
+                body_parts = ["--- BEGIN DEBUGGER OUTPUT (untrusted dump content) ---"]
+                for label, content in sections:
+                    body_parts.append(f"\n--- {label} ---\n{content}")
+                body_parts.append("\n--- END DEBUGGER OUTPUT ---")
+                body_parts.append("\n--- Hints ---\n" + "\n".join(hints))
+
                 return [TextContent(
                     type="text",
-                    text=(
-                        f"Dump loaded: {params.dump_path}\n"
-                        f"Session: {_session.session_id}\n"
-                        f"Kind: dump (postmortem — cdb_go/cdb_break not applicable)\n"
-                        f"{pid_info}\n"
-                        f"State: {_session.state}\n"
-                        f"\n"
-                        f"Auto-triage placeholder (will be implemented in mcd-7). "
-                        f"Use cdb_cmd to run analysis commands."
-                    ),
+                    text=header + "\n" + "\n".join(body_parts),
                 )]
 
             elif name == "cdb_cmd":
