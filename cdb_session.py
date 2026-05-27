@@ -84,6 +84,12 @@ DANGEROUS_COMMAND_PATTERNS = [
     re.compile(r"^\s*\.net\b", re.IGNORECASE),         # Loads managed debugging extension
     re.compile(r"^\s*\.dvalloc\b", re.IGNORECASE),     # Allocate virtual memory in debuggee
     re.compile(r"^\s*\.dvfree\b", re.IGNORECASE),      # Free virtual memory in debuggee
+    # Scripting commands with brace-delimited bodies. The splitter on
+    # [;\r\n] does not see inside { ... } blocks, so without these patterns
+    # `.foreach (x {lm}) { .shell whoami }` would bypass the .shell block.
+    re.compile(r"^\s*\.foreach\b", re.IGNORECASE),
+    re.compile(r"^\s*\.do\b", re.IGNORECASE),
+    re.compile(r"^\s*\.while\b", re.IGNORECASE),
 ]
 
 # Split commands on semicolons and newlines (prevents newline-based bypass).
@@ -137,6 +143,11 @@ def _validate_dump_path(path: str) -> None:
     _validate_path(path, "dump path")
     if path.startswith("-"):
         raise CDBError("Invalid dump path: cannot start with '-'")
+    if path.startswith("\\\\"):
+        raise CDBError(
+            "UNC paths are not allowed for dump files. Copy the dump locally "
+            "or map the share to a drive letter."
+        )
     m = re.search(r"\\+$", path)
     if m and len(m.group()) % 2 == 1:
         raise CDBError("Invalid dump path: odd number of trailing backslashes")
