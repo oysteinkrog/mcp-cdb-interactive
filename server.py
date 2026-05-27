@@ -46,6 +46,18 @@ def _get_session() -> CDBSession:
     return _session
 
 
+def _require_live_session(session: CDBSession, tool_name: str) -> None:
+    """Block tools that require a live debuggee from operating on dump sessions."""
+    if session.session_kind == "dump":
+        raise McpError(ErrorData(
+            code=INVALID_PARAMS,
+            message=(
+                f"{tool_name} is not available for dump sessions — the dump is "
+                f"a static snapshot. Use cdb_cmd for read-only analysis."
+            ),
+        ))
+
+
 def _clear_session():
     global _session
     if _session is not None:
@@ -290,7 +302,12 @@ def create_server(
                 name="cdb_dump",
                 description=(
                     "Create a full minidump (.dmp) of the debuggee process. "
-                    "The debuggee must be in a broken state."
+                    "The debuggee must be in a broken state. "
+                    "Works on both live debuggees and loaded dump sessions; "
+                    "when run on a dump session, output is constrained by the "
+                    "memory ranges captured in the source dump (re-dumping a "
+                    "basic /m minidump as /ma will NOT synthesise heap data "
+                    "that wasn't originally captured)."
                 ),
                 inputSchema=CdbDumpParams.model_json_schema(),
             ),
@@ -443,6 +460,7 @@ def create_server(
 
             elif name == "cdb_go":
                 session = _get_session()
+                _require_live_session(session, "cdb_go")
                 params = CdbGoParams(**arguments)
 
                 # Validate resume command against allowlist
@@ -468,6 +486,7 @@ def create_server(
 
             elif name == "cdb_break":
                 session = _get_session()
+                _require_live_session(session, "cdb_break")
                 success = await asyncio.to_thread(session.send_break)
                 if success:
                     return [TextContent(
@@ -482,11 +501,16 @@ def create_server(
 
             elif name == "cdb_detach":
                 session = _get_session()
+                is_dump = session.session_kind == "dump"
                 await asyncio.to_thread(session.detach)
                 _session = None
                 return [TextContent(
                     type="text",
-                    text="Detached from debuggee. Session closed.",
+                    text=(
+                        "Dump session closed."
+                        if is_dump
+                        else "Detached from debuggee. Session closed."
+                    ),
                 )]
 
             elif name == "cdb_status":
@@ -495,12 +519,22 @@ def create_server(
                         type="text",
                         text="Status: no-session\nNo active debugging session.",
                     )]
+                pid_str = (
+                    f"0x{_session.pid:x}" if _session.pid else "unknown"
+                )
+                dump_line = (
+                    f"\nDump file: {_session.dump_path}"
+                    if _session.session_kind == "dump" and _session.dump_path
+                    else ""
+                )
                 return [TextContent(
                     type="text",
                     text=(
                         f"Session: {_session.session_id}\n"
                         f"State: {_session.state}\n"
-                        f"Target PID: {_session.pid or 'unknown'}"
+                        f"Kind: {_session.session_kind}\n"
+                        f"Target PID: {pid_str}"
+                        f"{dump_line}"
                     ),
                 )]
 
