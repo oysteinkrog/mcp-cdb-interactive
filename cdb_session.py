@@ -119,6 +119,103 @@ def _validate_path(path: str, label: str = "path") -> None:
         raise CDBError(f"Invalid {label}: contains unsafe characters {chars}")
 
 
+# Kernel-mode dump magic bytes at file offset 0 (cdb.exe cannot open these)
+KERNEL_DUMP_MAGICS = (b"PAGEDU64", b"PAGEDUMP")
+
+# Dump suffixes cdb.exe will accept
+_DUMP_SUFFIXES = (".dmp", ".mdmp", ".hdmp")
+
+
+def _validate_dump_path(path: str) -> None:
+    """Validate a user-mode dump file path before passing to cdb -z.
+
+    Reuses _validate_path for injection safety, then layers dump-specific checks:
+    suffix allowlist, leading-dash rejection (would parse as a CDB flag), Windows
+    trailing-backslash parity (list2cmdline quoting quirk), existence, and a
+    magic-byte sniff that rejects kernel-mode dumps (which cdb cannot open).
+    """
+    _validate_path(path, "dump path")
+    if path.startswith("-"):
+        raise CDBError("Invalid dump path: cannot start with '-'")
+    m = re.search(r"\\+$", path)
+    if m and len(m.group()) % 2 == 1:
+        raise CDBError("Invalid dump path: odd number of trailing backslashes")
+    if not path.lower().endswith(_DUMP_SUFFIXES):
+        raise CDBError(
+            f"Unsupported dump file extension: {path!r}. "
+            f"Expected one of {_DUMP_SUFFIXES}."
+        )
+    if not os.path.isfile(path):
+        raise CDBError(f"Dump file not found: {path}")
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError as e:
+        raise CDBError(f"Cannot read dump header: {e}")
+    if head in KERNEL_DUMP_MAGICS:
+        raise CDBError(
+            f"Kernel-mode dump detected (magic {head!r}). "
+            f"cdb.exe only handles user-mode dumps; use kd.exe or windbg.exe."
+        )
+
+
+_SYMPATH_URL_RE = re.compile(r"^https?://[\w./-]+$", re.IGNORECASE)
+_SYMPATH_SRV_RE = re.compile(
+    r"^(SRV|SYMSRV|CACHE)\*[^*]*(\*[^*]*)*$",
+    re.IGNORECASE,
+)
+
+
+def _validate_sympath(sympath: str) -> None:
+    """Validate a symbol path passed via -y.
+
+    Symbol paths legitimately contain ';' (component separator), '*' (SRV tokens),
+    and URLs. _validate_path is too strict here. Splits on ';' and applies
+    per-component rules.
+    """
+    if len(sympath) > 2048:
+        raise CDBError("Symbol path too long (max 2048 chars)")
+    for raw in sympath.split(";"):
+        component = raw.strip()
+        if not component:
+            continue
+        if any(c in component for c in '"\r\n'):
+            raise CDBError(f"Invalid symbol-path component: {component!r}")
+        # URL inside a component: validate strictly. Strip leading SRV*..*  prefix.
+        url_part = component
+        if "*" in component:
+            head, _, tail = component.rpartition("*")
+            url_part = tail
+            if not _SYMPATH_SRV_RE.match(component) and "://" not in tail:
+                raise CDBError(f"Invalid SRV component: {component!r}")
+        if "://" in url_part:
+            if not _SYMPATH_URL_RE.match(url_part):
+                raise CDBError(
+                    f"Invalid symbol-server URL: {url_part!r} "
+                    f"(no credentials, query strings, or fragments allowed)"
+                )
+
+
+def _validate_search_path(path: str) -> None:
+    """Validate a multi-directory search path (e.g. for -i image path).
+
+    Allows ';' as component separator. Rejects unsafe chars per component and
+    UNC paths (\\\\server\\share) to prevent unintended network traversal.
+    """
+    if len(path) > 2048:
+        raise CDBError("Search path too long (max 2048 chars)")
+    for raw in path.split(";"):
+        component = raw.strip()
+        if not component:
+            continue
+        if any(c in component for c in '"\r\n'):
+            raise CDBError(f"Invalid search-path component: {component!r}")
+        if component.startswith("\\\\"):
+            raise CDBError(
+                f"UNC paths not allowed in search path: {component!r}"
+            )
+
+
 def _find_cdb(custom_path: Optional[str] = None) -> str:
     if custom_path:
         expanded = os.path.expandvars(os.path.expanduser(custom_path))
