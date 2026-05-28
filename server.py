@@ -274,7 +274,20 @@ def create_server(
 ) -> Server:
     """Create and configure the MCP server."""
     resolved_cdb = _find_cdb(cdb_path)
-    server = Server("cdb-interactive")
+    server = Server(
+        "cdb-interactive",
+        instructions=(
+            "CDB / WinDbg debugger wrapped as an MCP server. Three session "
+            "modes:\n"
+            "  • cdb_launch — start a new process under the debugger (live)\n"
+            "  • cdb_attach — attach to a running process by PID (live)\n"
+            "  • cdb_open_dump — open a user-mode crash dump for postmortem\n"
+            "    analysis (no live process)\n"
+            "Only one session is active at a time. Live-only tools "
+            "(cdb_go, cdb_break) are blocked on dump sessions with a "
+            "clear error. Use cdb_cmd for read-only analysis in any mode."
+        ),
+    )
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
@@ -282,17 +295,22 @@ def create_server(
             Tool(
                 name="cdb_launch",
                 description=(
-                    "Launch a process under the CDB debugger. "
+                    "Start a new process under the CDB debugger (LIVE session). "
                     "Breaks at the initial loader breakpoint with exception handlers set. "
-                    "Use cdb_cmd to inspect state, then cdb_go to resume execution."
+                    "Use cdb_cmd to inspect state, then cdb_go to resume execution. "
+                    "For an already-running process use cdb_attach; "
+                    "for a captured crash dump (.dmp) use cdb_open_dump."
                 ),
                 inputSchema=CdbLaunchParams.model_json_schema(),
             ),
             Tool(
                 name="cdb_attach",
                 description=(
-                    "Attach CDB to a running process by PID. "
-                    "Supports invasive (-p) and non-invasive (-pv) attach modes."
+                    "Attach CDB to a running process by PID (LIVE session). "
+                    "Supports invasive (-p) and non-invasive (-pv) attach modes. "
+                    "For a captured crash dump (.dmp) use cdb_open_dump instead — "
+                    "the PID recorded in a dump file is historical and not "
+                    "attachable."
                 ),
                 inputSchema=CdbAttachParams.model_json_schema(),
             ),
@@ -329,10 +347,13 @@ def create_server(
             Tool(
                 name="cdb_cmd",
                 description=(
-                    "Execute one or more WinDbg/CDB commands in the active session. "
-                    "The debuggee must be in a broken state (hit breakpoint, exception, "
-                    "or break signal). Common commands: kb (stack), lm (modules), "
-                    "~*kn (all thread stacks), !clrstack, !analyze -v, r (registers)."
+                    "Execute one or more WinDbg/CDB commands in the active session "
+                    "(works for live launch/attach AND dump sessions). For live "
+                    "sessions the debuggee must be in a broken state (hit breakpoint, "
+                    "exception, or break signal); dump sessions are always broken. "
+                    "Common commands: kb (stack), lm (modules), ~*kn (all thread "
+                    "stacks), !analyze -v, r (registers), .ecxr (switch to "
+                    "exception context — dumps), !clrstack (after cdb_load_extension)."
                 ),
                 inputSchema=CdbCmdParams.model_json_schema(),
             ),
@@ -340,6 +361,8 @@ def create_server(
                 name="cdb_go",
                 description=(
                     "Resume execution of the debuggee (go/continue). "
+                    "LIVE SESSIONS ONLY — blocked on dump sessions, which are "
+                    "static snapshots with no execution to resume. "
                     "Does NOT wait for the command to complete - returns immediately "
                     "with session state set to 'running'. Use cdb_break to interrupt later. "
                     "For single-step commands (p, t) that return to the prompt, use cdb_cmd."
@@ -350,6 +373,8 @@ def create_server(
                 name="cdb_break",
                 description=(
                     "Send a break signal to interrupt a running debuggee. "
+                    "LIVE SESSIONS ONLY — blocked on dump sessions (nothing to "
+                    "interrupt; dumps are always broken). "
                     "Use this when the target process is executing and you need to "
                     "inspect its state. After breaking, use cdb_cmd to examine threads."
                 ),
@@ -362,8 +387,12 @@ def create_server(
             Tool(
                 name="cdb_detach",
                 description=(
-                    "Detach from the debuggee and close the CDB session. "
-                    "The target process continues running after detach."
+                    "Close the active CDB session. For live launch/attach "
+                    "sessions, sends .detach and lets the target process "
+                    "continue running. For dump sessions, sends q (.detach "
+                    "is invalid on a static snapshot). Either way the "
+                    "session is closed and the slot becomes free for a new "
+                    "cdb_launch / cdb_attach / cdb_open_dump."
                 ),
                 inputSchema={
                     "type": "object",
@@ -374,8 +403,10 @@ def create_server(
             Tool(
                 name="cdb_status",
                 description=(
-                    "Get the current session status: running, broken, exited, "
-                    "or no-session."
+                    "Get the current session status. Returns the State "
+                    "(running / broken / exited / no-session), the Kind "
+                    "(live-launch / live-attach / dump), Target PID, and "
+                    "— for dump sessions — the loaded dump file path."
                 ),
                 inputSchema={
                     "type": "object",
@@ -400,9 +431,11 @@ def create_server(
                 name="cdb_output",
                 description=(
                     "Read recent buffered output from the debugger without "
-                    "sending a command. Useful for reading unsolicited output "
-                    "(stop reasons, exceptions, application logs) while the "
-                    "debuggee is running or after it breaks."
+                    "sending a command. Most useful in live sessions for "
+                    "reading unsolicited output (stop reasons, exceptions, "
+                    "application logs) while the debuggee is running or after "
+                    "it breaks. On dump sessions it returns whatever is in the "
+                    "buffer (usually the banner from open) and is rarely needed."
                 ),
                 inputSchema=CdbOutputParams.model_json_schema(),
             ),
@@ -410,8 +443,10 @@ def create_server(
                 name="cdb_wait",
                 description=(
                     "Wait for the debuggee to stop (break or exit). "
-                    "Use after cdb_go to wait until a breakpoint is hit, "
-                    "an exception occurs, or the process exits."
+                    "Use in LIVE sessions after cdb_go to wait until a "
+                    "breakpoint is hit, an exception occurs, or the process "
+                    "exits. On dump sessions the state is always 'broken', "
+                    "so this returns immediately — generally unnecessary."
                 ),
                 inputSchema=CdbWaitParams.model_json_schema(),
             ),
